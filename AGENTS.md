@@ -40,6 +40,7 @@ hack/
   e2e.sh                         # E2E entrypoint for operator and upstream VPA tests
 test/
   e2e/                           # Operator-specific e2e tests
+  e2e-upgrade/                   # Functional OLM upgrade checks (pre/post phases)
   helpers/                       # Shared test utilities
 ```
 
@@ -101,6 +102,7 @@ Stop and consult a human before:
 | OpenShift-specific RBAC filtering | `hack/filter-upstream-rbac.jq` |
 | Operator Deployment env vars | `config/manager/manager.yaml`, `Makefile` `predeploy` target, and CI if image substitution changes |
 | E2E suite behavior | `hack/e2e.sh` and CI job definitions in openshift/release |
+| Upgrade checks in `test/e2e-upgrade/` | `hack/local-upgrade.sh`, `docs/upgrade-testing.md`, and the `e2e-aws-upgrade` job in openshift/release |
 
 ## Further Reading
 

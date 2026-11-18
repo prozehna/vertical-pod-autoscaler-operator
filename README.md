@@ -211,5 +211,7 @@ KUBECONFIG=<path-to-kubeconfig>
 
 All tests should clean up after themselves.
 
+`make e2e-upgrade-local` installs a previous operator bundle, runs functional pre-upgrade checks, upgrades to a candidate bundle with OLM, runs functional post-upgrade checks, and then runs the e2e tests. These are the same phases as the `e2e-aws-upgrade` CI job. It requires `PREVIOUS_BUNDLE`, `OO_BUNDLE` and `KUBECONFIG`. The phases can also be run one at a time with `make e2e-upgrade-pre` and `make e2e-upgrade-post`. See [docs/upgrade-testing.md](docs/upgrade-testing.md).
+
 > [!TIP]
 > The e2e tests clones the upstream VPA repository to a temporary directory and runs upstream tests against the cluster. Optionally, you can specify an environment variable `AUTOSCALER_TMP` to specify an existing directory to use. If specified, the e2e script will checkout the correct branch, and pull. This saves network bandwidth and time from cloning the repository each time.
