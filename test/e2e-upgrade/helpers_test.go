@@ -664,7 +664,8 @@ func (e *testEnv) evictionEvents(ctx context.Context, ns string, uids sets.Set[t
 
 // verifyAdmissionOnNewPod deletes one pod of the workload and waits until
 // its replacement is created, ready, and has its CPU and memory requests set
-// by the admission controller to exactly want (the VPA bounds). Callers run
+// by the admission controller to exactly the values in the want parameter
+// (the VPA bounds). Callers run
 // this only after the admission controller has rolled out, so a replacement
 // pod admitted without mutation fails the check immediately rather than
 // being retried.
