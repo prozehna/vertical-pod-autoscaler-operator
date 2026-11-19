@@ -663,10 +663,11 @@ func (e *testEnv) evictionEvents(ctx context.Context, ns string, uids sets.Set[t
 }
 
 // verifyAdmissionOnNewPod deletes one pod of the workload and waits until
-// its replacement is created with requests mutated to want. Replacement
-// pods admitted without mutation (for example while the webhook endpoint is
-// still converging after a rollout; zero webhook downtime is out of scope)
-// are deleted again until the bounded timeout expires.
+// its replacement is created, ready, and has its CPU and memory requests set
+// by the admission controller to exactly want (the VPA bounds). Callers run
+// this only after the admission controller has rolled out, so a replacement
+// pod admitted without mutation fails the check immediately rather than
+// being retried.
 func (e *testEnv) verifyAdmissionOnNewPod(ctx context.Context, dep *appsv1.Deployment, want corev1.ResourceList) {
 	GinkgoHelper()
 	By(fmt.Sprintf("creating a new pod for %s/%s and checking the admission controller mutates it",
@@ -687,10 +688,7 @@ func (e *testEnv) verifyAdmissionOnNewPod(ctx context.Context, dep *appsv1.Deplo
 				continue
 			}
 			if !podMutatedTo(p, want) {
-				GinkgoWriter.Printf("new pod %s was admitted without the expected mutation, deleting it to retry\n",
-					describePod(p))
-				_ = e.cl.Delete(ctx, p)
-				g.Expect(podMutatedTo(p, want)).To(BeTrue(), "new pod %s not mutated", describePod(p))
+				StopTrying(fmt.Sprintf("new pod was admitted without the expected mutation: %s", describePod(p))).Now()
 			}
 			fresh = append(fresh, p)
 		}
