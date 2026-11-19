@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
@@ -866,23 +867,52 @@ func (e *testEnv) collectLogs(ctx context.Context, dir, ns string, pods []corev1
 	}
 }
 
-// deleteNamespace deletes ns and waits (bounded) for it to disappear.
-func (e *testEnv) deleteNamespace(ctx context.Context, ns string) {
+// deleteNamespace deletes ns and waits (bounded) for it to disappear. It
+// returns an error instead of failing, so cleanup can run every step.
+func (e *testEnv) deleteNamespace(ctx context.Context, ns string) error {
 	if ns == "" {
-		return
+		return nil
 	}
 	obj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 	if err := e.cl.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
-		GinkgoWriter.Printf("failed to delete namespace %s: %v\n", ns, err)
-		return
+		return fmt.Errorf("delete namespace %s: %w", ns, err)
 	}
-	Eventually(func() bool {
-		return apierrors.IsNotFound(e.cl.Get(ctx, client.ObjectKeyFromObject(obj), obj))
-	}, rolloutTimeout, pollInterval).Should(BeTrue(), "namespace %s was not deleted", ns)
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, rolloutTimeout, true, func(ctx context.Context) (bool, error) {
+		return apierrors.IsNotFound(e.cl.Get(ctx, client.ObjectKeyFromObject(obj), obj)), nil
+	})
+	if err != nil {
+		return fmt.Errorf("namespace %s was not deleted within %s: %w", ns, rolloutTimeout, err)
+	}
+	return nil
 }
 
-// imagesMatch compares two image references, treating references with the
-// same digest as equal (CI may render the same image as tag or digest).
+// restoreController puts spec back on the VerticalPodAutoscalerController,
+// retrying (bounded) on conflicts and transient errors. It returns an error
+// instead of failing, so cleanup can run every step.
+func (e *testEnv) restoreController(
+	ctx context.Context, spec *autoscalingv1.VerticalPodAutoscalerControllerSpec,
+) error {
+	var lastErr error
+	err := wait.PollUntilContextTimeout(ctx, pollInterval, rolloutTimeout, true, func(ctx context.Context) (bool, error) {
+		controller, err := e.getController(ctx)
+		if err == nil {
+			controller.Spec = *spec
+			err = e.cl.Update(ctx, controller)
+		}
+		lastErr = err
+		return err == nil, nil
+	})
+	if err != nil {
+		return fmt.Errorf("restore VerticalPodAutoscalerController %q: %w (last error: %v)", controllerName, err, lastErr)
+	}
+	return nil
+}
+
+// imagesMatch reports whether two image references name the same image: the
+// strings are identical, or both are pinned by digest (@sha256:...) and the
+// digests are equal, even if the registry host or repository path differ. A
+// tag reference never matches a digest reference, because the digest behind a
+// tag cannot be known without asking the registry.
 func imagesMatch(a, b string) bool {
 	if a == b {
 		return true

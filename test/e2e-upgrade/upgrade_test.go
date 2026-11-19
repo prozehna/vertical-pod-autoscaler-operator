@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"context"
+	"errors"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -136,25 +137,30 @@ var _ = Describe("VPA operator after the OLM upgrade", Ordered, Label(labelPost)
 			GinkgoWriter.Println("VPA_UPGRADE_SKIP_CLEANUP=true, leaving test resources in place")
 			return
 		}
-		env.deleteNamespace(ctx, newNS)
-		env.deleteNamespace(ctx, env.retainedNamespace)
+		// Run every cleanup step even if an earlier one fails, so a stuck
+		// namespace cannot leave a modified controller configuration behind
+		// for the next CI step. Fail at the end if any step failed.
+		var errs []error
+		note := func(err error) {
+			if err != nil {
+				GinkgoWriter.Println("cleanup:", err)
+				errs = append(errs, err)
+			}
+		}
+		note(env.deleteNamespace(ctx, newNS))
+		note(env.deleteNamespace(ctx, env.retainedNamespace))
 		if st != nil && st.OriginalControllerSpec != nil {
 			// Restore the controller configuration so the broader e2e suites
 			// that run after this phase see the operator defaults.
-			// A failed restore fails this phase rather than leaving a
-			// modified configuration for the next CI step.
-			Eventually(func() error {
-				controller, err := env.getController(ctx)
-				if err != nil {
-					return err
+			if err := env.restoreController(ctx, st.OriginalControllerSpec); err != nil {
+				note(err)
+			} else {
+				for _, name := range []string{recommenderDeployment, updaterDeployment, admissionDeployment} {
+					env.waitForRollout(ctx, env.operatorNamespace, name)
 				}
-				controller.Spec = *st.OriginalControllerSpec
-				return env.cl.Update(ctx, controller)
-			}, rolloutTimeout, pollInterval).Should(Succeed(), "restore VerticalPodAutoscalerController")
-			for _, name := range []string{recommenderDeployment, updaterDeployment, admissionDeployment} {
-				env.waitForRollout(ctx, env.operatorNamespace, name)
 			}
 		}
+		Expect(errors.Join(errs...)).NotTo(HaveOccurred(), "post-upgrade cleanup")
 	})
 
 	It("completed the OLM upgrade to the target CSV", func() {
