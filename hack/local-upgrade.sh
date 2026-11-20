@@ -10,7 +10,8 @@
 #   PREVIOUS_BUNDLE   Bundle image of the previous operator version to install.
 #   OO_BUNDLE         Bundle image of the candidate operator version.
 #   KUBECONFIG        Kubeconfig with cluster-admin rights on an OpenShift
-#                     cluster that does not run the VPA operator yet.
+#                     cluster that does not run the VPA operator yet. If it
+#                     does, the script stops before changing anything.
 #
 # Optional environment variables:
 #   PREVIOUS_OPERATOR  Operator image to repair the previous CSV with when the
@@ -22,7 +23,13 @@
 #                      CSV name the upgrade must end on (default: any CSV other
 #                      than the previous one).
 #   RUN_FULL_E2E       Run make e2e-olm-ci after the post-check (default: true).
-#   SKIP_CLEANUP       Leave the operator installed at the end (default: false).
+#                      Skipped when VPA_UPGRADE_SKIP_CLEANUP=true, because the
+#                      controller configuration is then not restored.
+#   VPA_UPGRADE_SKIP_CLEANUP
+#                      Keep the test namespaces and the modified controller
+#                      configuration after the post-check (default: false).
+#   SKIP_CLEANUP       Leave the operator and test namespaces installed at the
+#                      end (default: false).
 #   OPERATOR_SDK       operator-sdk binary (default: operator-sdk in PATH).
 #   ARTIFACT_DIR       Where test reports, identities and diagnostics are
 #                      written (default: /tmp/workdir).
@@ -52,15 +59,18 @@ cleanup() {
     return
   fi
   phase "Cleanup"
+  # Test namespaces (label vpa-upgrade-e2e) left behind by a failed phase
+  # would make the next run fail its leftovers check.
+  oc delete ns -l vpa-upgrade-e2e --ignore-not-found --wait=true --timeout=10m || true
   "${OPERATOR_SDK}" cleanup vertical-pod-autoscaler -n "${VPA_NS}" || true
   oc delete ns "${VPA_NS}" --ignore-not-found || true
   exit "${rc}"
 }
-trap cleanup EXIT
 
-# The single CSV in the namespace, or empty.
+# The single CSV in the namespace, or empty. CSVs that OLM copies in from
+# operators installed for all namespaces (label olm.copiedFrom) are ignored.
 current_csv() {
-  oc get csv -n "${VPA_NS}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+  oc get csv -n "${VPA_NS}" -l '!olm.copiedFrom' -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
 }
 
 wait_for_csv_succeeded() {
@@ -82,7 +92,11 @@ record CLUSTER_VERSION "$(oc get clusterversion version -o jsonpath='{.status.de
 record CLUSTER_PAYLOAD "$(oc get clusterversion version -o jsonpath='{.status.desired.image}')"
 
 phase "Installing the previous bundle"
+# Create the namespace before installing the cleanup trap: if it already
+# exists, a VPA operator may already be installed, and cleanup must not
+# uninstall it.
 oc create ns "${VPA_NS}"
+trap cleanup EXIT
 install_rc=0
 "${OPERATOR_SDK}" run bundle --timeout=10m -n "${VPA_NS}" --security-context-config restricted \
   "${PREVIOUS_BUNDLE}" || install_rc=$?
@@ -122,8 +136,13 @@ record CANDIDATE_RUNNING_OPERATOR "$(oc get deployment -n "${VPA_NS}" "${OPERATO
   -o jsonpath='{.spec.template.spec.containers[0].image}')"
 
 if [[ "${RUN_FULL_E2E:-true}" == "true" ]]; then
-  phase "Broader post-upgrade e2e"
-  make e2e-olm-ci
+  if [[ "${VPA_UPGRADE_SKIP_CLEANUP:-false}" == "true" ]]; then
+    echo "WARNING: VPA_UPGRADE_SKIP_CLEANUP=true left the modified controller configuration in place;"
+    echo "WARNING: skipping make e2e-olm-ci, which expects the operator defaults."
+  else
+    phase "Broader post-upgrade e2e"
+    make e2e-olm-ci
+  fi
 fi
 
 phase "Upgrade test passed"

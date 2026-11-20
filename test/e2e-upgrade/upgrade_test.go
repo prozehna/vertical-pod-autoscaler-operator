@@ -81,6 +81,14 @@ var _ = Describe("VPA operator before the OLM upgrade", Ordered, Label(labelPre)
 
 		controller, err := env.getController(ctx)
 		Expect(err).NotTo(HaveOccurred())
+		// Edge case: if an earlier pre phase failed after patching the
+		// controller and was re-run (after deleting the retained namespace),
+		// the controller still holds the test values. Saving those as the
+		// original would make cleanup "restore" the test values and leave
+		// them on the cluster, so refuse to continue instead.
+		Expect(InterceptGomegaFailure(func() { expectControllerSpec(Default, controller.Spec) })).To(HaveOccurred(),
+			"VerticalPodAutoscalerController %q already holds the test values from an earlier run; "+
+				"restore its original spec before re-running the pre-upgrade phase", controllerName)
 		st.OriginalControllerSpec = controller.Spec.DeepCopy()
 		st.ControllerUID = controller.UID
 		env.saveState(ctx, st)
@@ -113,6 +121,11 @@ var _ = Describe("VPA operator before the OLM upgrade", Ordered, Label(labelPre)
 		env.waitForRecommendation(ctx, env.retainedNamespace, initialWorkload, preUpgradeBounds)
 		env.verifyAdmissionOnNewPod(ctx, dep, preUpgradeBounds.resources())
 	})
+
+	It("records that the pre-upgrade phase completed", func() {
+		st.Completed = true
+		env.saveState(ctx, st)
+	})
 })
 
 var _ = Describe("VPA operator after the OLM upgrade", Ordered, Label(labelPost), func() {
@@ -126,8 +139,7 @@ var _ = Describe("VPA operator after the OLM upgrade", Ordered, Label(labelPost)
 	BeforeAll(func() {
 		ctx = context.Background()
 		st = env.loadState(ctx)
-		Expect(st.OldCSV).NotTo(BeEmpty(), "pre-upgrade state has no previous CSV; did the pre phase complete?")
-		Expect(st.Workloads).To(HaveLen(2), "pre-upgrade state is incomplete; did the pre phase complete?")
+		Expect(st.Completed).To(BeTrue(), "the pre-upgrade phase did not complete; re-run it before the upgrade")
 	})
 
 	AfterAll(func() {
@@ -222,19 +234,12 @@ var _ = Describe("VPA operator after the OLM upgrade", Ordered, Label(labelPost)
 		}
 	})
 
-	It("still provides recommendations for the retained VPAs", func() {
-		for _, name := range []string{recreateWorkload, initialWorkload} {
-			env.waitForRecommendation(ctx, env.retainedNamespace, name, preUpgradeBounds)
-		}
-	})
+	// The recommendations stored on the retained VPAs were written by the old
+	// recommender, so reading them proves nothing. Each retained VPA gets new
+	// bounds, and the checks wait for recommendations that only the upgraded
+	// recommender can have written.
 
-	It("mutates new pods of the retained workloads", func() {
-		for _, name := range []string{recreateWorkload, initialWorkload} {
-			env.verifyAdmissionOnNewPod(ctx, retain[name], preUpgradeBounds.resources())
-		}
-	})
-
-	It("evicts and mutates retained pods after the recommendation changes", func() {
+	It("recommends new values for the retained Recreate-mode VPA, then evicts and mutates its pods", func() {
 		dep := retain[recreateWorkload]
 		pods, err := env.livePods(ctx, dep.Namespace, dep.Spec.Selector.MatchLabels)
 		Expect(err).NotTo(HaveOccurred())
@@ -243,6 +248,17 @@ var _ = Describe("VPA operator after the OLM upgrade", Ordered, Label(labelPost)
 		env.setVPABounds(ctx, dep.Namespace, recreateWorkload, postUpgradeBounds)
 		env.waitForRecommendation(ctx, dep.Namespace, recreateWorkload, postUpgradeBounds)
 		env.waitForUpdaterEviction(ctx, dep, before, postUpgradeBounds.resources())
+	})
+
+	It("recommends new values for the retained Initial-mode VPA", func() {
+		env.setVPABounds(ctx, env.retainedNamespace, initialWorkload, postUpgradeBounds)
+		env.waitForRecommendation(ctx, env.retainedNamespace, initialWorkload, postUpgradeBounds)
+	})
+
+	It("mutates new pods of the retained workloads", func() {
+		for _, name := range []string{recreateWorkload, initialWorkload} {
+			env.verifyAdmissionOnNewPod(ctx, retain[name], postUpgradeBounds.resources())
+		}
 	})
 
 	It("recommends, evicts and mutates pods for a VPA created after the upgrade", func() {

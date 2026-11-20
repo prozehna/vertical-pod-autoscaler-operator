@@ -16,6 +16,8 @@ function print_help {
   echo "  - actuation            Test VPA actuation"
   echo "  - full-vpa             Test full VPA stack (default)"
   echo "  - operator             Test the VPA operator itself"
+  echo "  - upgrade-pre          Functional checks before an OLM upgrade (test/e2e-upgrade)"
+  echo "  - upgrade-post         Functional checks after an OLM upgrade (test/e2e-upgrade)"
 }
 
 namespace="openshift-vertical-pod-autoscaler"
@@ -30,7 +32,7 @@ KUBECTL=$1
 SUITE=${2:-full-vpa}
 
 case ${SUITE} in
-  recommender|updater|admission-controller|actuation|full-vpa|operator)
+  recommender|updater|admission-controller|actuation|full-vpa|operator|upgrade-pre|upgrade-post)
     ;;
   *)
     echo "ERROR: Invalid suite '${SUITE}'"
@@ -60,6 +62,24 @@ function run_operator_tests() {
   KUBECONFIG="${KUBECONFIG:-}" KUBECTL="${KUBECTL}" go test -mod=vendor ./test/e2e/... -v \
     -test.timeout=30m \
     --ginkgo.junit-report="${REPORT_DIR}/operator_artifacts/junit.xml"
+}
+
+# Runs one phase of the OLM upgrade checks in test/e2e-upgrade. The ginkgo
+# timeout plus grace period stays below the go test timeout, so on a slow run
+# ginkgo stops first and still runs cleanup and writes the JUnit report, rather
+# than go test killing the process.
+function run_upgrade_tests() {
+  local phase=$1
+  echo "Running ${phase} upgrade checks..."
+  mkdir -p "${REPORT_DIR}/${phase}"
+  KUBECONFIG="${KUBECONFIG:-}" ARTIFACT_DIR="${REPORT_DIR}" go test -mod=vendor -count=1 ./test/e2e-upgrade/ -v \
+    -test.timeout=75m \
+    --args \
+    --ginkgo.v \
+    --ginkgo.timeout=45m \
+    --ginkgo.grace-period=20m \
+    --ginkgo.label-filter="${phase}" \
+    --ginkgo.junit-report="${REPORT_DIR}/${phase}/junit_${phase//-/_}.xml"
 }
 
 function run_upstream_vpa_tests() {
@@ -248,6 +268,16 @@ if [ "${SUITE}" == "operator" ]; then
   echo "================================"
   echo "All tests completed successfully!"
   echo "================================"
+  exit 0
+fi
+
+# The upgrade checks run tests in this repo and do not touch the operand
+# deployments' replica counts.
+if [ "${SUITE}" == "upgrade-pre" ] || [ "${SUITE}" == "upgrade-post" ]; then
+  if ! run_upgrade_tests "${SUITE}"; then
+    echo "ERROR: ${SUITE} checks failed"
+    exit 1
+  fi
   exit 0
 fi
 

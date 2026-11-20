@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -178,6 +179,10 @@ type upgradeState struct {
 	NamespaceUID           types.UID                                          `json:"namespaceUID"`
 	VPAs                   map[string]types.UID                               `json:"vpas"`
 	Workloads              map[string]types.UID                               `json:"workloads"`
+	// Completed is set by the last step of the pre phase. The post phase
+	// refuses to run without it, so a pre phase that failed partway (after
+	// some state was already saved) cannot pass for a validated baseline.
+	Completed bool `json:"completed"`
 }
 
 func (e *testEnv) saveState(ctx context.Context, st *upgradeState) {
@@ -213,7 +218,14 @@ func (e *testEnv) loadState(ctx context.Context) *upgradeState {
 func (e *testEnv) listCSVs(ctx context.Context) ([]unstructured.Unstructured, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(csvGVK.GroupVersion().WithKind("ClusterServiceVersionList"))
-	if err := e.cl.List(ctx, list, client.InNamespace(e.operatorNamespace)); err != nil {
+	// OLM copies the CSV of every operator installed for all namespaces into
+	// each namespace, labelled olm.copiedFrom. Those are not ours.
+	notCopied, err := labels.Parse("!olm.copiedFrom")
+	if err != nil {
+		return nil, err
+	}
+	if err := e.cl.List(ctx, list, client.InNamespace(e.operatorNamespace),
+		client.MatchingLabelsSelector{Selector: notCopied}); err != nil {
 		return nil, err
 	}
 	return list.Items, nil
@@ -450,8 +462,23 @@ func newWorkload(ns, name string, replicas int32, image string) *appsv1.Deployme
 	}
 }
 
-func newVPA(ns, name, target, mode string, b vpaBounds) *unstructured.Unstructured {
+// vpaResourcePolicy returns a VPA resourcePolicy that controls CPU and memory
+// of every container and pins minAllowed and maxAllowed to b, so the
+// recommendation target is deterministic. newVPA and setVPABounds share it so
+// the policy shape the test checks is defined once.
+func vpaResourcePolicy(b vpaBounds) map[string]interface{} {
 	bounds := map[string]interface{}{fieldCPU: b.CPU, fieldMemory: b.Memory}
+	return map[string]interface{}{
+		"containerPolicies": []interface{}{map[string]interface{}{
+			"containerName":       "*",
+			"controlledResources": []interface{}{fieldCPU, fieldMemory},
+			fieldMinAllow:         bounds,
+			fieldMaxAllow:         runtime.DeepCopyJSONValue(bounds),
+		}},
+	}
+}
+
+func newVPA(ns, name, target, mode string, b vpaBounds) *unstructured.Unstructured {
 	u := &unstructured.Unstructured{Object: map[string]interface{}{
 		"metadata": map[string]interface{}{
 			"name":      name,
@@ -464,15 +491,8 @@ func newVPA(ns, name, target, mode string, b vpaBounds) *unstructured.Unstructur
 				"kind":       "Deployment",
 				"name":       target,
 			},
-			"updatePolicy": map[string]interface{}{"updateMode": mode},
-			"resourcePolicy": map[string]interface{}{
-				"containerPolicies": []interface{}{map[string]interface{}{
-					"containerName":       "*",
-					"controlledResources": []interface{}{fieldCPU, fieldMemory},
-					fieldMinAllow:         bounds,
-					fieldMaxAllow:         runtime.DeepCopyJSONValue(bounds),
-				}},
-			},
+			"updatePolicy":   map[string]interface{}{"updateMode": mode},
+			"resourcePolicy": vpaResourcePolicy(b),
 		},
 	}}
 	u.SetGroupVersionKind(vpaGVK)
@@ -489,15 +509,7 @@ func (e *testEnv) getVPA(ctx context.Context, ns, name string) (*unstructured.Un
 // setVPABounds updates the pinned minAllowed/maxAllowed of an existing VPA.
 func (e *testEnv) setVPABounds(ctx context.Context, ns, name string, b vpaBounds) {
 	GinkgoHelper()
-	bounds := map[string]interface{}{fieldCPU: b.CPU, fieldMemory: b.Memory}
-	patch := map[string]interface{}{"spec": map[string]interface{}{"resourcePolicy": map[string]interface{}{
-		"containerPolicies": []interface{}{map[string]interface{}{
-			"containerName":       "*",
-			"controlledResources": []interface{}{fieldCPU, fieldMemory},
-			fieldMinAllow:         bounds,
-			fieldMaxAllow:         runtime.DeepCopyJSONValue(bounds),
-		}},
-	}}}
+	patch := map[string]interface{}{"spec": map[string]interface{}{"resourcePolicy": vpaResourcePolicy(b)}}
 	data, err := json.Marshal(patch)
 	Expect(err).NotTo(HaveOccurred())
 	vpa := &unstructured.Unstructured{}
@@ -673,24 +685,28 @@ func (e *testEnv) waitForUpdaterEviction(
 			g.Expect(podMutatedTo(p, want)).To(BeTrue(), "pod %s was not mutated to the recommendation", describePod(p))
 			g.Expect(podReady(p)).To(BeTrue(), "pod %s is not ready", describePod(p))
 		}
-		g.Expect(e.evictionEvents(ctx, dep.Namespace, replacedUIDs)).NotTo(BeZero(),
-			"no %s events recorded for the replaced pods", evictedByVPAReason)
+		// Every original pod must have been evicted by the updater, not
+		// replaced for another reason (node drain, manual delete).
+		evicted, err := e.evictedPods(ctx, dep.Namespace, replacedUIDs)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(sets.List(replacedUIDs.Difference(evicted))).To(BeEmpty(),
+			"replaced pods without a %s event", evictedByVPAReason)
 	}, vpaTimeout, pollInterval).Should(Succeed())
 }
 
-// evictionEvents counts EvictedByVPA events for the given pods.
-func (e *testEnv) evictionEvents(ctx context.Context, ns string, uids sets.Set[types.UID]) (int, error) {
+// evictedPods returns which of the given pods have an EvictedByVPA event.
+func (e *testEnv) evictedPods(ctx context.Context, ns string, uids sets.Set[types.UID]) (sets.Set[types.UID], error) {
 	list := &corev1.EventList{}
 	if err := e.cl.List(ctx, list, client.InNamespace(ns)); err != nil {
-		return 0, err
+		return nil, err
 	}
-	n := 0
+	evicted := sets.New[types.UID]()
 	for _, ev := range list.Items {
 		if ev.Reason == evictedByVPAReason && uids.Has(ev.InvolvedObject.UID) {
-			n++
+			evicted.Insert(ev.InvolvedObject.UID)
 		}
 	}
-	return n, nil
+	return evicted, nil
 }
 
 // waitForAdmissionServing waits until the admission controller mutates a pod

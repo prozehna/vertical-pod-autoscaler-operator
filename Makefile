@@ -207,21 +207,13 @@ e2e-olm-local: full-olm-deploy test-e2e
 ## Functional OLM upgrade checks (test/e2e-upgrade). Run e2e-upgrade-pre against the previous operator version
 ## installed by OLM, upgrade the operator with OLM, then run e2e-upgrade-post. The pre phase leaves its resources
 ## in place for the post phase; the post phase cleans them up. See docs/upgrade-testing.md.
-E2E_UPGRADE_REPORT_DIR ?= $(or $(ARTIFACT_DIR),/tmp/workdir)
-E2E_UPGRADE_GO_TEST = ARTIFACT_DIR=$(E2E_UPGRADE_REPORT_DIR) go test -mod=vendor -count=1 -timeout=60m -v ./test/e2e-upgrade/ \
-	-args --ginkgo.v
-
 .PHONY: e2e-upgrade-pre
 e2e-upgrade-pre: ## Run the pre-upgrade functional checks. Requires the previous operator version installed with OLM.
-	mkdir -p $(E2E_UPGRADE_REPORT_DIR)/upgrade-pre
-	$(E2E_UPGRADE_GO_TEST) --ginkgo.label-filter=upgrade-pre \
-		--ginkgo.junit-report=$(E2E_UPGRADE_REPORT_DIR)/upgrade-pre/junit_upgrade_pre.xml
+	hack/e2e.sh $(shell which oc) upgrade-pre
 
 .PHONY: e2e-upgrade-post
 e2e-upgrade-post: ## Run the post-upgrade functional checks. Requires e2e-upgrade-pre and an OLM upgrade to have run.
-	mkdir -p $(E2E_UPGRADE_REPORT_DIR)/upgrade-post
-	$(E2E_UPGRADE_GO_TEST) --ginkgo.label-filter=upgrade-post \
-		--ginkgo.junit-report=$(E2E_UPGRADE_REPORT_DIR)/upgrade-post/junit_upgrade_post.xml
+	hack/e2e.sh $(shell which oc) upgrade-post
 
 ## Requires PREVIOUS_BUNDLE, OO_BUNDLE and KUBECONFIG. See hack/local-upgrade.sh for optional variables.
 .PHONY: e2e-upgrade-local

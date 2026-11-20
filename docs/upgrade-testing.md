@@ -50,11 +50,15 @@ Nothing is cleaned up. The post phase needs these resources as they are.
 * The controller CR, the namespace, the VPAs and the Deployments must have
   the same UIDs and spec as before the upgrade. A fresh install would fail
   this check.
-* Recommendations must still be provided for the retained VPAs.
-* New pods of both retained workloads must be mutated by the admission
-  controller.
-* After the retained `Recreate` VPA's bounds are raised, the updater must
-  evict its pods and the replacements must get the new requests.
+* The recommendations stored on the retained VPAs were written by the old
+  recommender, so both retained VPAs get raised bounds, and the check waits
+  for recommendations with the new values, which only the upgraded
+  recommender can write.
+* For the retained `Recreate` VPA, the updater must then evict every original
+  pod (one `EvictedByVPA` event per pod) and the replacements must get the new
+  requests.
+* New pods of both retained workloads must be mutated to the new values by the
+  admission controller.
 * A namespace, workload and VPA created after the upgrade must go through the
   same recommend, evict and mutate cycle.
 
@@ -71,6 +75,12 @@ VPA and its pods' metrics before it publishes a recommendation. Waits that
 depend on the recommender and updater loops are bounded at 15 minutes.
 Rollouts and CSV transitions are bounded at 10 minutes. Pod replacement is
 bounded at 5 minutes.
+
+Each phase runs through `hack/e2e.sh` (suites `upgrade-pre` and
+`upgrade-post`), like the other e2e suites. The Ginkgo timeout (45 minutes)
+plus its grace period for cleanup (20 minutes) stays below the `go test`
+timeout (75 minutes), so a slow run is stopped by Ginkgo, which still runs
+cleanup and writes the JUnit report, rather than killed by `go test`.
 
 Zero webhook downtime during the upgrade is out of scope, so no pod is
 created to test admission until the webhook is proven to serve: the suite
@@ -105,10 +115,18 @@ make e2e-upgrade-local
 
 See the header of `hack/local-upgrade.sh` for the optional variables, such as
 `PREVIOUS_OPERATOR` (to repair a previous bundle whose operator image is gone),
-`RUN_FULL_E2E` and `SKIP_CLEANUP`.
+`RUN_FULL_E2E` and `SKIP_CLEANUP`. The script stops without changing anything
+if the VPA operator namespace already exists. On failure it deletes the test
+namespaces and uninstalls the operator, unless `SKIP_CLEANUP=true`. With
+`VPA_UPGRADE_SKIP_CLEANUP=true` it skips `make e2e-olm-ci`, because the
+controller configuration is left modified.
 
 You can also run the phases one at a time and do the upgrade by hand. Delete
-`vpa-upgrade-retained` before re-running the pre phase.
+`vpa-upgrade-retained` before re-running the pre phase. If a pre phase failed
+after changing the controller configuration, also restore the
+`VerticalPodAutoscalerController` spec: the pre phase refuses to start while
+the controller still holds its test values, because it would otherwise save
+them as the original spec.
 
 ```sh
 make e2e-upgrade-pre
