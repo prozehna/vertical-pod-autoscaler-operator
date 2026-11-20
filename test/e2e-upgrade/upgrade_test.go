@@ -93,7 +93,7 @@ var _ = Describe("VPA operator before the OLM upgrade", Ordered, Label(labelPre)
 		controller.Spec.RecommendationOnly = upgradeControllerSpec.RecommendationOnly
 		Expect(env.cl.Patch(ctx, controller, patch)).To(Succeed(), "patch VerticalPodAutoscalerController")
 
-		env.waitForOperands(ctx)
+		env.waitForOperands(ctx, &upgradeControllerSpec)
 	})
 
 	It("recommends, evicts and mutates pods for a Recreate-mode VPA", func() {
@@ -147,19 +147,18 @@ var _ = Describe("VPA operator after the OLM upgrade", Ordered, Label(labelPost)
 				errs = append(errs, err)
 			}
 		}
-		note(env.deleteNamespace(ctx, newNS))
-		note(env.deleteNamespace(ctx, env.retainedNamespace))
+		// Restore the controller configuration first: it is quick and is what
+		// the broader e2e suites that run after this phase depend on. Then
+		// wait until the operands run with the restored args.
 		if st != nil && st.OriginalControllerSpec != nil {
-			// Restore the controller configuration so the broader e2e suites
-			// that run after this phase see the operator defaults.
 			if err := env.restoreController(ctx, st.OriginalControllerSpec); err != nil {
 				note(err)
 			} else {
-				for _, name := range []string{recommenderDeployment, updaterDeployment, admissionDeployment} {
-					env.waitForRollout(ctx, env.operatorNamespace, name)
-				}
+				note(InterceptGomegaFailure(func() { env.waitForOperands(ctx, st.OriginalControllerSpec) }))
 			}
 		}
+		note(env.deleteNamespace(ctx, newNS))
+		note(env.deleteNamespace(ctx, env.retainedNamespace))
 		Expect(errors.Join(errs...)).NotTo(HaveOccurred(), "post-upgrade cleanup")
 	})
 
@@ -193,7 +192,7 @@ var _ = Describe("VPA operator after the OLM upgrade", Ordered, Label(labelPost)
 	})
 
 	It("completed the operand rollouts with the expected image and configuration", func() {
-		env.waitForOperands(ctx)
+		env.waitForOperands(ctx, &upgradeControllerSpec)
 	})
 
 	It("retained the controller configuration", func() {

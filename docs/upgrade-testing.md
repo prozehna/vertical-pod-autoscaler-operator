@@ -20,8 +20,9 @@ cluster.
   that CSV's image. It records the CSV name and image.
 * It creates the namespace `vpa-upgrade-retained` and fails if it already
   exists.
-* It sets non-default values in the `default` `VerticalPodAutoscalerController`
-  and waits until the operand deployments roll out with the matching args.
+* It sets non-default tuning values in the `default`
+  `VerticalPodAutoscalerController` and waits until the operand deployments
+  roll out with the matching args.
 * It runs `recreate-workload`, a 2-replica Deployment with a `Recreate`-mode
   VPA. Pods start with requests below the VPA bounds. The check passes when:
   * the recommender publishes the expected recommendation,
@@ -57,8 +58,10 @@ Nothing is cleaned up. The post phase needs these resources as they are.
 * A namespace, workload and VPA created after the upgrade must go through the
   same recommend, evict and mutate cycle.
 
-After the checks, diagnostics are collected, the test namespaces are deleted,
-and the controller spec is restored for the `e2e-olm-ci` step that follows.
+After the checks, diagnostics are collected, the controller spec is restored
+(and the operands are waited on until they run with the restored args) for the
+`e2e-olm-ci` step that follows, and the test namespaces are deleted. Every
+cleanup step runs even if an earlier one fails; the phase fails if any did.
 
 ## Bounds and timeouts
 
@@ -69,9 +72,11 @@ depend on the recommender and updater loops are bounded at 15 minutes.
 Rollouts and CSV transitions are bounded at 10 minutes. Pod replacement is
 bounded at 5 minutes.
 
-Zero webhook downtime during the upgrade is out of scope. A replacement pod
-admitted without mutation while the webhook is still converging is deleted and
-retried within that bound.
+Zero webhook downtime during the upgrade is out of scope, so no pod is
+created to test admission until the webhook is proven to serve: the suite
+repeats a server-side dry-run pod create (admission runs, nothing is stored)
+until the returned pod is mutated. After that, a replacement pod admitted
+without mutation fails the check immediately.
 
 ## Artifacts
 

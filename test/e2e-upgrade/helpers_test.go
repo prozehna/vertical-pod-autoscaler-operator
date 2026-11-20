@@ -83,23 +83,20 @@ var (
 	}
 
 	// upgradeControllerSpec is applied to the "default"
-	// VerticalPodAutoscalerController before the upgrade. Every value differs
-	// from the operator defaults so that a reset to defaults (for example by
-	// recreating the CR) is detectable after the upgrade. Only fields that
-	// exist in the previous operator version are used.
+	// VerticalPodAutoscalerController before the upgrade. Every tuning value
+	// differs from the operator defaults (0.15, 25, 250 and 2) so that a reset
+	// to defaults (for example by recreating the CR) is detectable after the
+	// upgrade. RecommendationOnly is set explicitly to its default, false,
+	// because the updater and admission controller must run. MinReplicas 1
+	// still lets the updater evict pods of the 2-replica test workloads. Only
+	// fields that exist in the previous operator version are used.
 	upgradeControllerSpec = autoscalingv1.VerticalPodAutoscalerControllerSpec{
 		SafetyMarginFraction: ptr.To(0.2),
 		PodMinCPUMillicores:  ptr.To(30.0),
 		PodMinMemoryMb:       ptr.To(260.0),
-		MinReplicas:          ptr.To[int64](2),
+		MinReplicas:          ptr.To[int64](1),
 		RecommendationOnly:   ptr.To(false),
 	}
-	expectedRecommenderArgs = []string{
-		"--recommendation-margin-fraction=0.2",
-		"--pod-recommendation-min-cpu-millicores=30",
-		"--pod-recommendation-min-memory-mb=260",
-	}
-	expectedUpdaterArgs = []string{"--min-replicas=2"}
 
 	// Workload pods start with requests well below the VPA bounds so the
 	// updater must evict them and the admission controller must raise them.
@@ -328,29 +325,63 @@ func operandImage(operator *appsv1.Deployment) string {
 	return ""
 }
 
-// waitForOperands waits for all three operand deployments to be rolled out
-// with the operand image configured on the operator, and for their args to
-// reflect upgradeControllerSpec.
-func (e *testEnv) waitForOperands(ctx context.Context) {
+// argExpectation lists the args an operand deployment must have and the
+// flags it must not have.
+type argExpectation struct {
+	present     []string
+	absentFlags []string
+}
+
+// operandArgExpectations returns, per operand deployment, the args the
+// operator renders for spec. The operator adds "flag=value" (formatted with
+// %v) only for fields that are set, so an unset field means its flag must be
+// absent.
+func operandArgExpectations(spec *autoscalingv1.VerticalPodAutoscalerControllerSpec) map[string]argExpectation {
+	var rec, upd argExpectation
+	add := func(x *argExpectation, flag string, set bool, v interface{}) {
+		if set {
+			x.present = append(x.present, fmt.Sprintf("%s=%v", flag, v))
+		} else {
+			x.absentFlags = append(x.absentFlags, flag)
+		}
+	}
+	add(&rec, "--recommendation-margin-fraction", spec.SafetyMarginFraction != nil,
+		ptr.Deref(spec.SafetyMarginFraction, 0))
+	add(&rec, "--pod-recommendation-min-cpu-millicores", spec.PodMinCPUMillicores != nil,
+		ptr.Deref(spec.PodMinCPUMillicores, 0))
+	add(&rec, "--pod-recommendation-min-memory-mb", spec.PodMinMemoryMb != nil, ptr.Deref(spec.PodMinMemoryMb, 0))
+	add(&upd, "--min-replicas", spec.MinReplicas != nil, ptr.Deref(spec.MinReplicas, 0))
+	return map[string]argExpectation{
+		recommenderDeployment: rec,
+		updaterDeployment:     upd,
+		admissionDeployment:   {},
+	}
+}
+
+// waitForOperands waits until all three operand deployments run the operand
+// image configured on the operator with args matching spec, and are fully
+// rolled out. Waiting for the args first means a rollout that has not started
+// yet cannot pass for a finished one.
+func (e *testEnv) waitForOperands(ctx context.Context, spec *autoscalingv1.VerticalPodAutoscalerControllerSpec) {
 	GinkgoHelper()
 	operator := e.waitForRollout(ctx, e.operatorNamespace, operatorDeployment)
 	wantImage := operandImage(operator)
 	Expect(wantImage).NotTo(BeEmpty(), "operator deployment has no %s env var", operandImageEnv)
 
-	wantArgs := map[string][]string{
-		recommenderDeployment: expectedRecommenderArgs,
-		updaterDeployment:     expectedUpdaterArgs,
-		admissionDeployment:   nil,
-	}
-	for name, args := range wantArgs {
+	for name, want := range operandArgExpectations(spec) {
 		By(fmt.Sprintf("waiting for operand %s to roll out with the configured image and args", name))
 		Eventually(func(g Gomega) {
 			dep, err := e.getDeployment(ctx, e.operatorNamespace, name)
 			g.Expect(err).NotTo(HaveOccurred(), "get operand %s", name)
 			c := dep.Spec.Template.Spec.Containers[0]
 			g.Expect(c.Image).To(Equal(wantImage), "%s image", name)
-			for _, a := range args {
+			for _, a := range want.present {
 				g.Expect(c.Args).To(ContainElement(a), "%s args", name)
+			}
+			for _, flag := range want.absentFlags {
+				for _, a := range c.Args {
+					g.Expect(strings.HasPrefix(a, flag+"=")).To(BeFalse(), "%s has unexpected arg %s", name, a)
+				}
 			}
 		}, rolloutTimeout, pollInterval).Should(Succeed())
 		e.waitForRollout(ctx, e.operatorNamespace, name)
@@ -662,15 +693,49 @@ func (e *testEnv) evictionEvents(ctx context.Context, ns string, uids sets.Set[t
 	return n, nil
 }
 
+// waitForAdmissionServing waits until the admission controller mutates a pod
+// of dep to want, using server-side dry-run creates: the API server runs
+// admission but stores nothing. The admission controller has no readiness
+// probe and registers its webhook itself some time after it starts, so a
+// finished rollout does not prove the webhook is serving. The dry-run pod
+// copies the owner references of a live pod so that the admission controller
+// matches it to the workload's VPA.
+func (e *testEnv) waitForAdmissionServing(ctx context.Context, dep *appsv1.Deployment, want corev1.ResourceList) {
+	GinkgoHelper()
+	By(fmt.Sprintf("waiting for the admission webhook to mutate a dry-run pod for %s/%s", dep.Namespace, dep.Name))
+	pods, err := e.livePods(ctx, dep.Namespace, dep.Spec.Selector.MatchLabels)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(pods).NotTo(BeEmpty(), "workload %s has no pods", dep.Name)
+	owners := make([]metav1.OwnerReference, 0, len(pods[0].OwnerReferences))
+	for _, o := range pods[0].OwnerReferences {
+		o.BlockOwnerDeletion = nil
+		owners = append(owners, o)
+	}
+
+	Eventually(func(g Gomega) {
+		probe := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName:    dep.Name + "-admission-probe-",
+				Namespace:       dep.Namespace,
+				Labels:          dep.Spec.Template.Labels,
+				OwnerReferences: owners,
+			},
+			Spec: *dep.Spec.Template.Spec.DeepCopy(),
+		}
+		g.Expect(e.cl.Create(ctx, probe, client.DryRunAll)).To(Succeed(), "dry-run create pod")
+		g.Expect(podMutatedTo(probe, want)).To(BeTrue(), "dry-run pod not mutated yet: %s", describePod(probe))
+	}, podTimeout, pollInterval).Should(Succeed())
+}
+
 // verifyAdmissionOnNewPod deletes one pod of the workload and waits until
 // its replacement is created, ready, and has its CPU and memory requests set
 // by the admission controller to exactly the values in the want parameter
-// (the VPA bounds). Callers run
-// this only after the admission controller has rolled out, so a replacement
-// pod admitted without mutation fails the check immediately rather than
-// being retried.
+// (the VPA bounds). It first waits for the webhook to serve (see
+// waitForAdmissionServing), so a replacement pod admitted without mutation
+// fails the check immediately rather than being retried.
 func (e *testEnv) verifyAdmissionOnNewPod(ctx context.Context, dep *appsv1.Deployment, want corev1.ResourceList) {
 	GinkgoHelper()
+	e.waitForAdmissionServing(ctx, dep, want)
 	By(fmt.Sprintf("creating a new pod for %s/%s and checking the admission controller mutates it",
 		dep.Namespace, dep.Name))
 	pods, err := e.livePods(ctx, dep.Namespace, dep.Spec.Selector.MatchLabels)
